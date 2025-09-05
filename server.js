@@ -271,10 +271,11 @@ async function callOpenAI(messages, opts = {}) {
 // Start the frontend server (openai.js) as a child process
 const { spawn } = require('child_process');
 const FRONTEND_PATH = path.join(__dirname, '../frontend/openai.js');
+// Spawn the frontend helper script without using a shell so paths with spaces
+// are passed as a single argument (avoids Node interpreting "D:\Work\Solvevare" as a module)
 const frontendProcess = spawn('node', [FRONTEND_PATH], {
   cwd: path.join(__dirname, '../frontend'),
-  stdio: 'inherit',
-  shell: true
+  stdio: 'inherit'
 });
 frontendProcess.on('error', (err) => {
   console.error('Failed to start frontend server:', err);
