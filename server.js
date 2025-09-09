@@ -465,6 +465,9 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(FRONTEND_ROOT, 'index.html'));
 });
 
-const PORT = 3004;
-app.listen(PORT, ()=> console.log('Server running on port', PORT));
+const PORT = process.env.PORT || 4002;
+const HOST = process.env.HOST || '31.97.41.27';
+app.listen(PORT, HOST, () => {
+  console.log(`Server running at http://${HOST}:${PORT}/`);
+});
 
