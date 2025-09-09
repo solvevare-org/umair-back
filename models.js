@@ -30,6 +30,7 @@ const ChatSchema = new mongoose.Schema({
   role: String,
   text: String,
   meta: Object,
+  teacherId: { type: String, index: true },
   timestamp: { type: Date, default: Date.now }
 });
 

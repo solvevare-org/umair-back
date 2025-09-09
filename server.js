@@ -47,6 +47,32 @@ function wrapIfNotHtml(content) {
   const safe = (content || "").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Worksheet (fallback)</title><style>body{font-family:system-ui;padding:20px;background:#fff}pre{white-space:pre-wrap}</style></head><body><h2>Model output (not valid HTML)</h2><pre>${safe}</pre></body></html>`;
 }
+function parseJsonLenient(text){
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch(_) {}
+  try {
+    const unfenced = stripCodeFences(text);
+    return JSON.parse(unfenced);
+  } catch(_) {}
+  try {
+    // Replace smart quotes and stray control chars
+    let t = String(text).replace(/[“”]/g,'"').replace(/[‘’]/g, "'").replace(/[\u0000-\u001F\u007F-\u009F]/g, '');
+    // Extract largest JSON object block
+    const first = t.indexOf('{');
+    const last = t.lastIndexOf('}');
+    if (first !== -1 && last !== -1 && last > first) {
+      const candidate = t.slice(first, last + 1);
+      return JSON.parse(candidate);
+    }
+  } catch(_) {}
+  try {
+    const m = text.match(/```json([\s\S]*?)```/i);
+    if (m) return JSON.parse(m[1]);
+  } catch(_) {}
+  return null;
+}
 async function extractImageText(filePath) {
   if (!Tesseract) throw new Error("tesseract.js is not installed. Run: npm install tesseract.js");
   const normalized = path.resolve(String(filePath).replace(/\\/g, "/"));
@@ -66,8 +92,11 @@ async function extractPdfText(filePath) {
 async function callOpenAI(messages, opts = {}) {
   if (!_fetch) throw new Error("fetch not available");
     const payload = {
-      model: opts.model || "gpt-5",
+      model: opts.model || "gpt-4o-mini",
       messages,
+      temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.7,
+      max_tokens: typeof opts.max_tokens === 'number' ? opts.max_tokens : 800,
+      response_format: (opts && opts.force_json) ? { type: 'json_object' } : undefined,
   };
   const res = await _fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -95,7 +124,7 @@ app.use(authRouter);
 
 // ======================= MongoDB Setup ========================
 const { Quiz, Attempt, Chat } = require('./models');
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/quizDB';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/quizDB';
 mongoose.connect(MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true }).then(()=>{
   console.log('Connected to MongoDB');
 }).catch(err=>{
@@ -108,23 +137,23 @@ app.post('/api/parse-image', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const filePath = req.file.path;
-    const imageText = await extractImageText(filePath);
-    const systemPrompt = req.body.prompt || 'You are an expert in creating educational quizzes. Convert the following content into a quiz format. Return only valid JSON with the following structure: { title: string, description: string, questions: [{ question: string, options: string[], correctAnswer: number, explanation: string }] }';
+    let imageText = await extractImageText(filePath);
+    if (imageText && imageText.length > 6000) imageText = imageText.slice(0, 6000);
+    const baseSystemPrompt = 'You are an expert quiz generator. Output ONLY valid JSON (no markdown, no prose). Schema: {"title": string, "description": string, "questions": [{"id": string, "question": string, "options": string[], "correctAnswer": number, "explanation": string}]}. Rules: 1) Do not include code fences. 2) Do not include comments. 3) Use zero-based index for correctAnswer. 4) Ensure JSON is syntactically valid. 5) Provide 3–6 options where applicable. 6) Keep explanations concise.';
+    const teacherPrompt = req.body && req.body.prompt ? String(req.body.prompt) : '';
+    const ensureJsonLine = 'Return ONLY valid JSON per the schema above.';
+    const needsJsonReinforce = teacherPrompt && !/json/i.test(teacherPrompt);
+    const systemContent = teacherPrompt
+      ? baseSystemPrompt + '\nTeacher instructions: ' + teacherPrompt + (needsJsonReinforce ? ('\n' + ensureJsonLine) : '')
+      : baseSystemPrompt;
     const messages = [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemContent },
       { role: 'user', content: imageText }
     ];
-    const aiResponse = await callOpenAI(messages, { temperature: 0.7, max_tokens: 2000 });
-    let quizData;
-    try {
-      quizData = JSON.parse(aiResponse);
-    } catch (e) {
-      const match = aiResponse.match(/```json([\s\S]*?)```/i);
-      if (match) {
-        quizData = JSON.parse(match[1]);
-      } else {
-        throw new Error('OpenAI did not return valid JSON');
-      }
+    const aiResponse = await callOpenAI(messages, { temperature: 0.2, max_tokens: 1200, model: "gpt-4o-mini", force_json: true });
+    const quizData = parseJsonLenient(aiResponse);
+    if (!quizData || typeof quizData !== 'object') {
+      return res.status(422).json({ ok: false, error: 'OpenAI did not return valid JSON', raw: String(aiResponse).slice(0, 4000) });
     }
     // Generate hint for each question using OpenAI
     if (quizData && Array.isArray(quizData.questions)) {
@@ -136,7 +165,7 @@ app.post('/api/parse-image', upload.single('file'), async (req, res) => {
             { role: 'user', content: questionText }
           ];
           try {
-            const hint = await callOpenAI(hintMessages, { temperature: 0.5, max_tokens: 100 });
+            const hint = await callOpenAI(hintMessages, { temperature: 0.5, max_tokens: 120, model: "gpt-4o-mini" });
             q.hint = hint.trim();
           } catch (e) {
             q.hint = '';
@@ -160,23 +189,23 @@ app.post('/api/parse-pdf', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const filePath = req.file.path;
-    const pdfText = await extractPdfText(filePath);
-    const systemPrompt = req.body.prompt || 'You are an expert in creating educational quizzes. Convert the following content into a quiz format. Return only valid JSON with the following structure: { title: string, description: string, questions: [{ question: string, options: string[], correctAnswer: number, explanation: string }] }';
+    let pdfText = await extractPdfText(filePath);
+    if (pdfText && pdfText.length > 6000) pdfText = pdfText.slice(0, 6000);
+    const baseSystemPrompt = 'You are an expert quiz generator. Output ONLY valid JSON (no markdown, no prose). Schema: {"title": string, "description": string, "questions": [{"id": string, "question": string, "options": string[], "correctAnswer": number, "explanation": string}]}. Rules: 1) Do not include code fences. 2) Do not include comments. 3) Use zero-based index for correctAnswer. 4) Ensure JSON is syntactically valid. 5) Provide 3–6 options where applicable. 6) Keep explanations concise.';
+    const teacherPrompt = req.body && req.body.prompt ? String(req.body.prompt) : '';
+    const ensureJsonLine = 'Return ONLY valid JSON per the schema above.';
+    const needsJsonReinforce = teacherPrompt && !/json/i.test(teacherPrompt);
+    const systemContent = teacherPrompt
+      ? baseSystemPrompt + '\nTeacher instructions: ' + teacherPrompt + (needsJsonReinforce ? ('\n' + ensureJsonLine) : '')
+      : baseSystemPrompt;
     const messages = [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemContent },
       { role: 'user', content: pdfText }
     ];
-    const aiResponse = await callOpenAI(messages, { temperature: 0.7, max_tokens: 2000 });
-    let quizData;
-    try {
-      quizData = JSON.parse(aiResponse);
-    } catch (e) {
-      const match = aiResponse.match(/```json([\s\S]*?)```/i);
-      if (match) {
-        quizData = JSON.parse(match[1]);
-      } else {
-        throw new Error('OpenAI did not return valid JSON');
-      }
+    const aiResponse = await callOpenAI(messages, { temperature: 0.2, max_tokens: 1200, model: "gpt-4o-mini", force_json: true });
+    const quizData = parseJsonLenient(aiResponse);
+    if (!quizData || typeof quizData !== 'object') {
+      return res.status(422).json({ ok: false, error: 'OpenAI did not return valid JSON', raw: String(aiResponse).slice(0, 4000) });
     }
     // Generate hint for each question using OpenAI
     if (quizData && Array.isArray(quizData.questions)) {
@@ -188,7 +217,7 @@ app.post('/api/parse-pdf', upload.single('file'), async (req, res) => {
             { role: 'user', content: questionText }
           ];
           try {
-            const hint = await callOpenAI(hintMessages, { temperature: 0.5, max_tokens: 100 });
+            const hint = await callOpenAI(hintMessages, { temperature: 0.5, max_tokens: 120, model: "gpt-4o-mini" });
             q.hint = hint.trim();
           } catch (e) {
             q.hint = '';
@@ -320,40 +349,8 @@ app.get('/api/quizzes/:id', (req, res, next) => {
     // if filePath present, serve full URL
     const host = req.get('origin') || `${req.protocol}://${req.get('host')}`;
     const fileUrl = q.filePath ? `${host}/server/uploads/${path.basename(q.filePath)}` : null;
-    // Add correct/acceptable/explanation fields if missing
-    let quizObj = q.toObject();
-    let updated = false;
-    if (quizObj.finalizedJson && Array.isArray(quizObj.finalizedJson.questions)) {
-      for (const question of quizObj.finalizedJson.questions) {
-        if (!question.correct || !question.explanation) {
-          // Use OpenAI to generate correct answer and explanation if missing
-          try {
-            const messages = [
-              { role: 'system', content: 'You are an expert teacher. For the following quiz question, provide the correct answer and a brief explanation in JSON format: {"correct": ..., "explanation": ...}.' },
-              { role: 'user', content: question.question || question.prompt }
-            ];
-            const aiResponse = await callOpenAI(messages, { temperature: 0.3, max_tokens: 200 });
-            let aiJson;
-            try {
-              aiJson = JSON.parse(stripCodeFences(aiResponse));
-            } catch (e) {
-              const match = aiResponse.match(/```json([\s\S]*?)```/i);
-              if (match) aiJson = JSON.parse(match[1]);
-            }
-            if (aiJson && aiJson.correct) {
-              question.correct = aiJson.correct;
-              updated = true;
-            }
-            if (aiJson && aiJson.explanation) {
-              question.explanation = aiJson.explanation;
-              updated = true;
-            }
-          } catch (e) {
-            // If OpenAI fails, skip
-          }
-        }
-      }
-    }
+    // Return stored quiz as-is to avoid latency from enrichment on GET
+    const quizObj = q.toObject();
     res.json({ ok:true, quiz: quizObj, fileUrl });
   }catch(err){ res.status(500).json({ ok:false, error:err.message }); }
 });
@@ -400,10 +397,37 @@ app.post('/api/attempts', async (req,res)=>{
 app.post('/api/chats', async (req,res)=>{
   try{
     const { id, role, text, meta, timestamp, teacherId } = req.body;
-    if (!teacherId) return res.status(400).json({ ok:false, error:'teacherId required' });
-    const doc = { id: id || ('msg_' + Date.now().toString(36)), role, text, meta, teacherId, timestamp: timestamp ? new Date(timestamp) : new Date() };
+    console.log('[POST /api/chats] raw body =', req.body);
+    // Accept alternative payload shapes
+    const resolvedText = (typeof text === 'string' && text)
+      || (req.body && typeof req.body.content === 'string' && req.body.content)
+      || (req.body && req.body.message && typeof req.body.message.content === 'string' && req.body.message.content)
+      || (req.body && req.body.message && typeof req.body.message.text === 'string' && req.body.message.text)
+      || '';
+    const effectiveRole = (typeof role === 'string' && role)
+      || (req.body && req.body.message && typeof req.body.message.role === 'string' && req.body.message.role)
+      || 'user';
+    const effectiveTeacherId = teacherId || (req.body && req.body.message && req.body.message.teacherId) || (meta && meta.teacherId);
+    if (!effectiveTeacherId) return res.status(400).json({ ok:false, error:'teacherId required' });
+    if (!resolvedText || (typeof resolvedText === 'string' && resolvedText.trim() === '')) {
+      return res.status(400).json({ ok:false, error:'text/content required' });
+    }
+    const doc = {
+      id: id || ('msg_' + Date.now().toString(36)),
+      role: effectiveRole,
+      text: resolvedText,
+      meta,
+      teacherId: effectiveTeacherId,
+      timestamp: timestamp ? new Date(timestamp) : new Date()
+    };
+    console.log('[POST /api/chats] resolvedText =', resolvedText, 'role =', effectiveRole, 'teacherId =', effectiveTeacherId);
+    // Attach raw payload for debugging when no text provided
+    if (!doc.text) {
+      doc.meta = Object.assign({}, doc.meta || {}, { raw: req.body });
+    }
     const upsert = await Chat.findOneAndUpdate({ id: doc.id }, doc, { upsert: true, new: true, setDefaultsOnInsert: true });
-    res.json({ ok:true, chat: upsert });
+    console.log('[POST /api/chats] saved chat =', upsert && upsert.toObject ? upsert.toObject() : upsert);
+    res.json({ ok:true, chat: upsert && upsert.toObject ? upsert.toObject() : upsert });
   }catch(err){ res.status(500).json({ ok:false, error:err.message }); }
 });
 
